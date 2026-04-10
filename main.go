@@ -1003,15 +1003,21 @@ func (m model) handleInsert(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	default:
 		if len(msg.Runes) > 0 {
-			line := m.lines[m.cy]
-			newLine := make([]rune, len(line)+len(msg.Runes))
-			copy(newLine, line[:m.cx])
-			copy(newLine[m.cx:], msg.Runes)
-			copy(newLine[m.cx+len(msg.Runes):], line[m.cx:])
-			m.lines[m.cy] = newLine
-			m.cx += len(msg.Runes)
-			m.dirty = true
-			m.dotTyped = append(m.dotTyped, msg.Runes...)
+			if msg.Paste {
+				// Bracketed paste: runes may contain newlines; insert without
+				// auto-indent and without recording into dotTyped.
+				m.insertPaste(string(msg.Runes))
+			} else {
+				line := m.lines[m.cy]
+				newLine := make([]rune, len(line)+len(msg.Runes))
+				copy(newLine, line[:m.cx])
+				copy(newLine[m.cx:], msg.Runes)
+				copy(newLine[m.cx+len(msg.Runes):], line[m.cx:])
+				m.lines[m.cy] = newLine
+				m.cx += len(msg.Runes)
+				m.dirty = true
+				m.dotTyped = append(m.dotTyped, msg.Runes...)
+			}
 		}
 	}
 	return m, nil
@@ -1420,6 +1426,44 @@ func (m *model) yankLine() {
 	m.message = "1 line yanked"
 }
 
+// insertPaste inserts clipboard text (from bracketed paste) at the cursor in
+// insert mode. Each newline splits the line without adding auto-indent.
+func (m *model) insertPaste(text string) {
+	if text == "" {
+		return
+	}
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	text = strings.ReplaceAll(text, "\r", "\n")
+	chunks := strings.Split(text, "\n")
+	for i, chunk := range chunks {
+		if i > 0 {
+			// Split the current line at cx, creating a new line below.
+			line := m.lines[m.cy]
+			before := append([]rune{}, line[:m.cx]...)
+			after := append([]rune{}, line[m.cx:]...)
+			m.lines[m.cy] = before
+			rest := make([][]rune, len(m.lines[m.cy+1:]))
+			copy(rest, m.lines[m.cy+1:])
+			m.lines = append(m.lines[:m.cy+1], append([][]rune{after}, rest...)...)
+			m.cy++
+			m.cx = 0
+		}
+		if len(chunk) == 0 {
+			continue
+		}
+		ins := []rune(chunk)
+		line := m.lines[m.cy]
+		newLine := make([]rune, len(line)+len(ins))
+		copy(newLine, line[:m.cx])
+		copy(newLine[m.cx:], ins)
+		copy(newLine[m.cx+len(ins):], line[m.cx:])
+		m.lines[m.cy] = newLine
+		m.cx += len(ins)
+	}
+	m.dirty = true
+	m.scrollIntoView()
+}
+
 func (m *model) paste(before bool) {
 	if len(m.register) == 0 {
 		return
@@ -1435,9 +1479,13 @@ func (m *model) paste(before bool) {
 		m.lines = append(m.lines[:at], append(pasted, tail...)...)
 		m.cy = at
 		m.cx = 0
-	} else if len(m.register[0]) > 0 {
-		line := m.lines[m.cy]
+	} else if len(m.register) == 1 {
+		// Single-line character-wise paste
 		ins := m.register[0]
+		if len(ins) == 0 {
+			return
+		}
+		line := m.lines[m.cy]
 		at := m.cx
 		if !before && len(line) > 0 {
 			at++
@@ -1448,6 +1496,37 @@ func (m *model) paste(before bool) {
 		copy(newLine[at+len(ins):], line[at:])
 		m.lines[m.cy] = newLine
 		m.cx = at + len(ins) - 1
+	} else {
+		// Multi-line character-wise paste: split current line at insertion point,
+		// append register[0] to the first half, insert middle rows as new lines,
+		// prepend register[last] to the second half.
+		line := m.lines[m.cy]
+		at := m.cx
+		if !before && len(line) > 0 {
+			at++
+		}
+		firstHalf := append([]rune{}, line[:at]...)
+		secondHalf := append([]rune{}, line[at:]...)
+
+		firstRow := append(firstHalf, m.register[0]...)
+		lastRow := append(append([]rune{}, m.register[len(m.register)-1]...), secondHalf...)
+
+		newLines := [][]rune{firstRow}
+		for _, r := range m.register[1 : len(m.register)-1] {
+			newLines = append(newLines, append([]rune{}, r...))
+		}
+		newLines = append(newLines, lastRow)
+
+		tail := make([][]rune, len(m.lines[m.cy+1:]))
+		copy(tail, m.lines[m.cy+1:])
+		m.lines = append(m.lines[:m.cy], append(newLines, tail...)...)
+		m.cy = m.cy + len(newLines) - 1
+		lastRegLen := len(m.register[len(m.register)-1])
+		if lastRegLen > 0 {
+			m.cx = lastRegLen - 1
+		} else {
+			m.cx = 0
+		}
 	}
 	m.dirty = true
 	m.scrollIntoView()
