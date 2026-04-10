@@ -1,1 +1,10 @@
 norn
+*.env*
+*.key
+*.pem
+*.crt
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
