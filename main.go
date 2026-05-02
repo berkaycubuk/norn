@@ -2,12 +2,18 @@ package main
 
 import (
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
+
+	"path/filepath"
+	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"unicode"
 
+	"github.com/BurntSushi/toml"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -25,6 +31,7 @@ const (
 	searchMode
 	visualMode
 	visualLineMode
+	browserMode
 )
 
 type snapshot struct {
@@ -34,12 +41,52 @@ type snapshot struct {
 
 type shellDoneMsg struct{ err error }
 
+// --- Buffer (multi-file support) ---
+
+type Buffer struct {
+	lines     [][]rune
+	cx, cy    int
+	filename  string
+	dirty     bool
+	readonly  bool
+	scrollY   int
+	undoStack []snapshot
+	redoStack []snapshot
+}
+
+// --- Config ---
+
+type EditorConfig struct {
+	TabStop        int    `toml:"tabstop"`
+	ExpandTab      bool   `toml:"expandtab"`
+	Number         bool   `toml:"number"`
+	RelativeNumber bool   `toml:"relativenumber"`
+	Clipboard      string `toml:"clipboard"`
+}
+
+type Config struct {
+	Editor EditorConfig `toml:"editor"`
+}
+
+// --- Directory entry (file browser) ---
+
+type dirEntry struct {
+	Name  string
+	Size  int64
+	Mode  fs.FileMode
+	IsDir bool
+}
+
+// ---------------------------------------------------------------------------
+// Model
+// ---------------------------------------------------------------------------
+
 type model struct {
-	lines      [][]rune
-	cx, cy     int
-	mode       mode
-	pendingKey   string // operator-pending key (e.g. "d" waiting for motion)
-	pendingCount int    // count saved when pendingKey was set
+	lines    [][]rune
+	cx, cy   int
+	mode     mode
+	pendingKey   string
+	pendingCount int
 	command    string
 	width      int
 	height     int
@@ -64,18 +111,29 @@ type model struct {
 	vx, vy int
 	// f/F/t/T repeat
 	lastFindChar rune
-	lastFindType string // "f" "F" "t" "T"
+	lastFindType string
 	// . repeat
-	dot      func(*model) // last change, nil if none
-	dotEntry string       // insert entry type being recorded
-	dotTyped []rune       // runes typed in current insert session
+	dot      func(*model)
+	dotEntry string
+	dotTyped []rune
 	// read-only buffer (e.g. help)
 	readonly  bool
-	prevModel *model // saved state to return to after closing a readonly buffer
+	prevModel *model
+	// indent string (computed from config)
+	indentStr string
+	// config
+	cfg Config
+	// multi-buffer
+	buffers []*Buffer
+	bufIdx  int
+	// file browser
+	browserDir        string
+	browserEntries    []dirEntry
+	browserCur        int
+	browserScroll     int
+	browserShowHidden bool
+	browserPendingG   bool
 }
-
-// indentStr is used for >> / << and Tab in insert mode.
-const indentStr = "\t"
 
 // ---------------------------------------------------------------------------
 // Styles
@@ -90,11 +148,21 @@ var (
 	statusCmd       = lipgloss.NewStyle().Background(lipgloss.Color("3")).Foreground(lipgloss.Color("0")).Bold(true).Padding(0, 1)
 	statusSearch    = lipgloss.NewStyle().Background(lipgloss.Color("5")).Foreground(lipgloss.Color("0")).Bold(true).Padding(0, 1)
 	statusVisual    = lipgloss.NewStyle().Background(lipgloss.Color("13")).Foreground(lipgloss.Color("0")).Bold(true).Padding(0, 1)
-	statusBar    = lipgloss.NewStyle().Background(lipgloss.Color("236")).Foreground(lipgloss.Color("250")).Padding(0, 1)
-	lineNum      = lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Width(4).Align(lipgloss.Right)
-	readonlyTag  = lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Bold(true)
-	errStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
-	infoStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("2"))
+	statusBrowser   = lipgloss.NewStyle().Background(lipgloss.Color("6")).Foreground(lipgloss.Color("0")).Bold(true).Padding(0, 1)
+	statusBar       = lipgloss.NewStyle().Background(lipgloss.Color("236")).Foreground(lipgloss.Color("250")).Padding(0, 1)
+	lineNumStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Width(4).Align(lipgloss.Right)
+	readonlyTag     = lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Bold(true)
+	errStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
+	infoStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("2"))
+	// Tab line
+	tabBarStyle     = lipgloss.NewStyle().Background(lipgloss.Color("234")).Foreground(lipgloss.Color("245"))
+	activeTabStyle  = lipgloss.NewStyle().Background(lipgloss.Color("62")).Foreground(lipgloss.Color("230")).Bold(true).Padding(0, 1)
+	inactiveTabStyle = lipgloss.NewStyle().Background(lipgloss.Color("236")).Foreground(lipgloss.Color("250")).Padding(0, 1)
+	// Browser
+	browserHeaderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("14")).Bold(true)
+	browserDirStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("12")).Bold(true)
+	browserCursorStyle = lipgloss.NewStyle().Reverse(true)
+	browserSizeStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 )
 
 // ---------------------------------------------------------------------------
@@ -202,14 +270,13 @@ func firstNonBlank(line []rune) int {
 	return 0
 }
 
-// leadingWhitespace returns a copy of the leading whitespace of line.
 func leadingWhitespace(line []rune) []rune {
 	for i, r := range line {
 		if !isSpace(r) {
 			return append([]rune{}, line[:i]...)
 		}
 	}
-	return append([]rune{}, line...) // whole line is whitespace
+	return append([]rune{}, line...)
 }
 
 // ---------------------------------------------------------------------------
@@ -238,10 +305,172 @@ func joinLines(lines [][]rune) string {
 }
 
 // ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
+
+func defaultConfig() Config {
+	return Config{
+		Editor: EditorConfig{
+			TabStop:        4,
+			ExpandTab:      false,
+			Number:         true,
+			RelativeNumber: false,
+			Clipboard:      "auto",
+		},
+	}
+}
+
+func configPaths() []string {
+	var paths []string
+	xdg := os.Getenv("XDG_CONFIG_HOME")
+	if xdg == "" {
+		home, _ := os.UserHomeDir()
+		if home != "" {
+			xdg = filepath.Join(home, ".config")
+		}
+	}
+	if xdg != "" {
+		paths = append(paths, filepath.Join(xdg, "norn", "config.toml"))
+	}
+	home, _ := os.UserHomeDir()
+	if home != "" {
+		paths = append(paths, filepath.Join(home, ".nornrc.toml"))
+	}
+	return paths
+}
+
+func loadConfig() Config {
+	cfg := defaultConfig()
+	for _, p := range configPaths() {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		if err := toml.Unmarshal(data, &cfg); err != nil {
+			continue
+		}
+		return cfg
+	}
+	return cfg
+}
+
+func computeIndentStr(cfg Config) string {
+	if cfg.Editor.ExpandTab {
+		return strings.Repeat(" ", cfg.Editor.TabStop)
+	}
+	return "\t"
+}
+
+func expandHome(path string) string {
+	if strings.HasPrefix(path, "~/") {
+		home, _ := os.UserHomeDir()
+		if home != "" {
+			return filepath.Join(home, path[2:])
+		}
+	}
+	return path
+}
+
+func defaultConfigContent() string {
+	return `# norn configuration
+# See :help for available commands
+
+[editor]
+# Number of spaces per tab (used for >>/<< and expandtab)
+tabstop = 4
+
+# Insert spaces instead of tabs
+expandtab = false
+
+# Show line numbers
+number = true
+
+# Show relative line numbers
+relativenumber = false
+
+# Clipboard integration: "auto", "none", "pbcopy", "xclip", "xsel", "wl-copy"
+# "auto" detects based on OS
+clipboard = "auto"
+`
+}
+
+// ---------------------------------------------------------------------------
+// Clipboard
+// ---------------------------------------------------------------------------
+
+func clipboardCmd(cfg Config) (copyCmd, pasteCmd string) {
+	clip := cfg.Editor.Clipboard
+	switch clip {
+	case "pbcopy":
+		return "pbcopy", "pbpaste"
+	case "xclip":
+		return "xclip -selection clipboard", "xclip -selection clipboard -o"
+	case "xsel":
+		return "xsel --clipboard --input", "xsel --clipboard --output"
+	case "wl-copy":
+		return "wl-copy", "wl-paste"
+	case "none", "":
+		return "", ""
+	case "auto":
+		switch runtime.GOOS {
+		case "darwin":
+			return "pbcopy", "pbpaste"
+		case "linux":
+			if _, err := exec.LookPath("wl-copy"); err == nil {
+				return "wl-copy", "wl-paste"
+			}
+			if _, err := exec.LookPath("xclip"); err == nil {
+				return "xclip -selection clipboard", "xclip -selection clipboard -o"
+			}
+			if _, err := exec.LookPath("xsel"); err == nil {
+				return "xsel --clipboard --input", "xsel --clipboard --output"
+			}
+			return "", ""
+		case "windows":
+			return "clip", "powershell -command Get-Clipboard"
+		}
+	}
+	return "", ""
+}
+
+func copyToClipboard(text string, cfg Config) error {
+	copyCmd, _ := clipboardCmd(cfg)
+	if copyCmd == "" {
+		return fmt.Errorf("no clipboard command available")
+	}
+	parts := strings.Fields(copyCmd)
+	cmd := exec.Command(parts[0], parts[1:]...)
+	cmd.Stdin = strings.NewReader(text)
+	return cmd.Run()
+}
+
+func pasteFromClipboard(cfg Config) (string, error) {
+	_, pasteCmd := clipboardCmd(cfg)
+	if pasteCmd == "" {
+		return "", fmt.Errorf("no clipboard command available")
+	}
+	parts := strings.Fields(pasteCmd)
+	cmd := exec.Command(parts[0], parts[1:]...)
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
+}
+
+func (m *model) clipCopy(text string) {
+	if m.cfg.Editor.Clipboard == "none" || m.cfg.Editor.Clipboard == "" {
+		return
+	}
+	_ = copyToClipboard(text, m.cfg)
+}
+
+// ---------------------------------------------------------------------------
 // Model init
 // ---------------------------------------------------------------------------
 
 func newModel(filename string) model {
+	cfg := loadConfig()
 	m := model{
 		lines:     [][]rune{{}},
 		mode:      normalMode,
@@ -249,6 +478,8 @@ func newModel(filename string) model {
 		height:    24,
 		filename:  filename,
 		searchFwd: true,
+		cfg:       cfg,
+		indentStr: computeIndentStr(cfg),
 	}
 	if filename != "" {
 		data, err := os.ReadFile(filename)
@@ -260,10 +491,166 @@ func newModel(filename string) model {
 			m.message = fmt.Sprintf("\"%s\" %dL", filename, len(m.lines))
 		}
 	}
+	m.buffers = []*Buffer{{
+		lines:     m.lines,
+		cx:        m.cx,
+		cy:        m.cy,
+		filename:  m.filename,
+		dirty:     m.dirty,
+		scrollY:   m.scrollY,
+		undoStack: m.undoStack,
+		redoStack: m.redoStack,
+	}}
 	return m
 }
 
 func (m model) Init() tea.Cmd { return nil }
+
+// ---------------------------------------------------------------------------
+// Buffer management
+// ---------------------------------------------------------------------------
+
+func (m *model) saveToBuffer() {
+	if m.bufIdx >= len(m.buffers) {
+		return
+	}
+	b := m.buffers[m.bufIdx]
+	b.lines = m.lines
+	b.cx = m.cx
+	b.cy = m.cy
+	b.filename = m.filename
+	b.dirty = m.dirty
+	b.readonly = m.readonly
+	b.scrollY = m.scrollY
+	b.undoStack = m.undoStack
+	b.redoStack = m.redoStack
+}
+
+func (m *model) loadFromBuffer() {
+	b := m.buffers[m.bufIdx]
+	m.lines = b.lines
+	m.cx = b.cx
+	m.cy = b.cy
+	m.filename = b.filename
+	m.dirty = b.dirty
+	m.readonly = b.readonly
+	m.scrollY = b.scrollY
+	m.undoStack = b.undoStack
+	m.redoStack = b.redoStack
+}
+
+func (m *model) openFileInNewBuffer(filename string) {
+	absPath, _ := filepath.Abs(filename)
+	// Check if already open
+	for i, b := range m.buffers {
+		absB, _ := filepath.Abs(b.filename)
+		if absB == absPath {
+			m.switchToBuffer(i)
+			return
+		}
+	}
+	m.saveToBuffer()
+	buf := &Buffer{filename: filename}
+	data, err := os.ReadFile(filename)
+	if err != nil && !os.IsNotExist(err) {
+		m.message = fmt.Sprintf("E: %v", err)
+		m.msgIsErr = true
+		return
+	} else if err == nil {
+		buf.lines = splitLines(string(data))
+	} else {
+		buf.lines = [][]rune{{}}
+	}
+	m.buffers = append(m.buffers, buf)
+	m.bufIdx = len(m.buffers) - 1
+	m.loadFromBuffer()
+	m.message = fmt.Sprintf("\"%s\" %dL", filename, len(m.lines))
+	m.msgIsErr = false
+}
+
+func (m *model) switchToBuffer(idx int) {
+	if idx < 0 || idx >= len(m.buffers) || idx == m.bufIdx {
+		return
+	}
+	m.saveToBuffer()
+	m.bufIdx = idx
+	m.loadFromBuffer()
+	m.mode = normalMode
+	b := m.buffers[idx]
+	name := b.filename
+	if name == "" {
+		name = "[No Name]"
+	}
+	m.message = fmt.Sprintf("\"%s\" %dL", name, len(b.lines))
+	m.msgIsErr = false
+}
+
+func (m *model) nextBuffer() {
+	if len(m.buffers) <= 1 {
+		m.message = "E: only one buffer"
+		m.msgIsErr = false
+		return
+	}
+	idx := m.bufIdx + 1
+	if idx >= len(m.buffers) {
+		idx = 0
+	}
+	m.switchToBuffer(idx)
+}
+
+func (m *model) prevBuffer() {
+	if len(m.buffers) <= 1 {
+		m.message = "E: only one buffer"
+		m.msgIsErr = false
+		return
+	}
+	idx := m.bufIdx - 1
+	if idx < 0 {
+		idx = len(m.buffers) - 1
+	}
+	m.switchToBuffer(idx)
+}
+
+func (m *model) closeCurrentBuffer(force bool) {
+	if m.dirty && !force {
+		m.message = "E89: No write since last change (add ! to override)"
+		m.msgIsErr = true
+		return
+	}
+	if len(m.buffers) == 1 {
+		m.buffers[0] = &Buffer{lines: [][]rune{{}}, filename: ""}
+		m.loadFromBuffer()
+		m.mode = normalMode
+		return
+	}
+	m.buffers = append(m.buffers[:m.bufIdx], m.buffers[m.bufIdx+1:]...)
+	if m.bufIdx >= len(m.buffers) {
+		m.bufIdx = len(m.buffers) - 1
+	}
+	m.loadFromBuffer()
+	m.mode = normalMode
+}
+
+func (m *model) reloadFile() {
+	if m.filename == "" {
+		m.message = "E32: No file name"
+		m.msgIsErr = true
+		return
+	}
+	data, err := os.ReadFile(m.filename)
+	if err != nil {
+		m.message = fmt.Sprintf("E: %v", err)
+		m.msgIsErr = true
+		return
+	}
+	m.saveUndo()
+	m.lines = splitLines(string(data))
+	m.cx, m.cy = 0, 0
+	m.scrollY = 0
+	m.dirty = false
+	m.message = fmt.Sprintf("\"%s\" %dL reloaded", m.filename, len(m.lines))
+	m.msgIsErr = false
+}
 
 // ---------------------------------------------------------------------------
 // Undo / redo
@@ -308,7 +695,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		m.scrollIntoView()
+		if m.mode == browserMode {
+			m.browserScrollIntoView()
+		} else {
+			m.scrollIntoView()
+		}
 		return m, nil
 	case shellDoneMsg:
 		if msg.err != nil {
@@ -328,6 +719,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.handleSearch(msg)
 		case visualMode, visualLineMode:
 			return m.handleVisual(msg)
+		case browserMode:
+			return m.handleBrowser(msg)
 		}
 	}
 	return m, nil
@@ -342,7 +735,6 @@ func (m model) handleNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	key := msg.String()
 
 	// --- accumulate count digits ---
-	// "0" with no prior count means "go to start of line" (handled below)
 	if m.pendingKey == "" {
 		if (key >= "1" && key <= "9") || (key == "0" && m.countStr != "") {
 			m.countStr += key
@@ -398,7 +790,7 @@ func (m model) handleNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			} else {
 				m.saveUndo()
 				mk := key
-				m.applyOperatorRaw("c", mk) // sets mode=insert without dot side-effect
+				m.applyOperatorRaw("c", mk)
 				m.dotEntry = "c" + mk
 				m.dotTyped = nil
 			}
@@ -413,6 +805,8 @@ func (m model) handleNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.cy = 0
 				m.cx = 0
 				m.scrollIntoView()
+			} else if key == "p" {
+				m.pasteClipboard(false)
 			}
 		case "r":
 			if len(msg.Runes) > 0 && m.cx < len(m.lines[m.cy]) {
@@ -884,7 +1278,7 @@ func (m *model) doFind(typ string, ch rune) {
 // ---------------------------------------------------------------------------
 
 func (m *model) indentLines(start, end, dir int) {
-	indent := []rune(indentStr)
+	indent := []rune(m.indentStr)
 	for i := start; i <= end && i < len(m.lines); i++ {
 		line := m.lines[i]
 		if dir > 0 {
@@ -893,15 +1287,18 @@ func (m *model) indentLines(start, end, dir int) {
 				m.cx += len(indent)
 			}
 		} else {
-			// remove one indentStr from start (tab or up to len(indentStr) spaces)
 			if len(line) > 0 && line[0] == '\t' {
 				m.lines[i] = line[1:]
 				if m.cy == i && m.cx > 0 {
 					m.cx--
 				}
 			} else {
+				tabWidth := m.cfg.Editor.TabStop
+				if m.indentStr[0] == ' ' {
+					tabWidth = len(m.indentStr)
+				}
 				sp := 0
-				for sp < len(indent) && sp < len(line) && line[sp] == ' ' {
+				for sp < tabWidth && sp < len(line) && line[sp] == ' ' {
 					sp++
 				}
 				if sp > 0 {
@@ -932,7 +1329,6 @@ func (m model) handleInsert(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if n := len(m.lines[m.cy]); n > 0 && m.cx >= n {
 			m.cx = n - 1
 		}
-		// finalise dot record for insert session
 		if m.dotEntry != "" {
 			entry := m.dotEntry
 			typed := append([]rune{}, m.dotTyped...)
@@ -950,7 +1346,7 @@ func (m model) handleInsert(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 	case "tab":
-		ins := []rune(indentStr)
+		ins := []rune(m.indentStr)
 		line := m.lines[m.cy]
 		newLine := make([]rune, len(line)+len(ins))
 		copy(newLine, line[:m.cx])
@@ -997,15 +1393,12 @@ func (m model) handleInsert(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.cx = len(indent)
 		m.dirty = true
 		m.scrollIntoView()
-		// record Enter + indent prefix in dotTyped so . replay re-indents
 		m.dotTyped = append(m.dotTyped, '\n')
 		m.dotTyped = append(m.dotTyped, indent...)
 
 	default:
 		if len(msg.Runes) > 0 {
 			if msg.Paste {
-				// Bracketed paste: runes may contain newlines; insert without
-				// auto-indent and without recording into dotTyped.
 				m.insertPaste(string(msg.Runes))
 			} else {
 				line := m.lines[m.cy]
@@ -1028,7 +1421,6 @@ func (m model) handleInsert(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func applyInsertEntry(m *model, entry string) {
 	switch entry {
 	case "i":
-		// cursor stays
 	case "a":
 		if n := len(m.lines[m.cy]); n > 0 && m.cx < n {
 			m.cx++
@@ -1055,16 +1447,13 @@ func applyInsertEntry(m *model, entry string) {
 		m.lines[m.cy] = append([]rune{}, m.lines[m.cy][:m.cx]...)
 		m.dirty = true
 	default:
-		// "cw", "ce", "cb", "c0", "c$", "c^"
 		if len(entry) >= 2 && entry[0] == 'c' {
 			motion := entry[1:]
-			m.applyOperator("c_raw", motion) // "c_raw" skips mode change
+			m.applyOperator("c_raw", motion)
 		}
 	}
 }
 
-// insertRuneAt inserts a single rune at the current cursor position.
-// Newlines in dotTyped are expanded back into actual line splits.
 func insertRuneAt(m *model, r rune) {
 	if r == '\n' {
 		line := m.lines[m.cy]
@@ -1158,10 +1547,18 @@ func (m model) execCommand(cmd string) (tea.Model, tea.Cmd) {
 			m.msgIsErr = true
 			return m, nil
 		}
+		if len(m.buffers) > 1 {
+			m.closeCurrentBuffer(true)
+			return m, nil
+		}
 		return m, tea.Quit
 	case "q!":
 		if m.readonly && m.prevModel != nil {
 			m = *m.prevModel
+			return m, nil
+		}
+		if len(m.buffers) > 1 {
+			m.closeCurrentBuffer(true)
 			return m, nil
 		}
 		return m, tea.Quit
@@ -1180,6 +1577,122 @@ func (m model) execCommand(cmd string) (tea.Model, tea.Cmd) {
 		m.msgIsErr = false
 	case "help", "h":
 		m.openHelpBuffer()
+
+	// --- Multi-buffer commands ---
+	case "e":
+		if len(parts) < 2 {
+			m.message = "E: filename required (e.g. :e file.go)"
+			m.msgIsErr = true
+			return m, nil
+		}
+		if m.prevModel != nil {
+			m.message = "E45: close help first (:q)"
+			m.msgIsErr = true
+			return m, nil
+		}
+		target := expandHome(parts[1])
+		target = filepath.Clean(target)
+		info, err := os.Stat(target)
+		if err != nil {
+			m.message = fmt.Sprintf("E: %v", err)
+			m.msgIsErr = true
+		} else if info.IsDir() {
+			m.openBrowser(target)
+		} else {
+			m.openFileInNewBuffer(target)
+		}
+	case "bn":
+		if m.prevModel != nil {
+			m.message = "E45: close help first (:q)"
+			m.msgIsErr = true
+			return m, nil
+		}
+		m.nextBuffer()
+	case "bp":
+		if m.prevModel != nil {
+			m.message = "E45: close help first (:q)"
+			m.msgIsErr = true
+			return m, nil
+		}
+		m.prevBuffer()
+	case "bd":
+		if m.prevModel != nil {
+			m.message = "E45: close help first (:q)"
+			m.msgIsErr = true
+			return m, nil
+		}
+		m.closeCurrentBuffer(false)
+	case "bd!":
+		if m.prevModel != nil {
+			m.message = "E45: close help first (:q)"
+			m.msgIsErr = true
+			return m, nil
+		}
+		m.closeCurrentBuffer(true)
+	case "ls":
+		var items []string
+		for i, b := range m.buffers {
+			marker := " "
+			if i == m.bufIdx {
+				marker = "%"
+			}
+			dirty := ""
+			if b.dirty {
+				dirty = "+"
+			}
+			name := b.filename
+			if name == "" {
+				name = "[No Name]"
+			}
+			items = append(items, fmt.Sprintf("%d%s %s%s", i+1, marker, filepath.Base(name), dirty))
+		}
+		m.message = strings.Join(items, "  ")
+		m.msgIsErr = false
+	case "b":
+		if m.prevModel != nil {
+			m.message = "E45: close help first (:q)"
+			m.msgIsErr = true
+			return m, nil
+		}
+		if len(parts) < 2 {
+			m.message = "E: buffer number required (e.g. :b 2)"
+			m.msgIsErr = true
+		} else {
+			n, err := strconv.Atoi(parts[1])
+			if err != nil || n < 1 || n > len(m.buffers) {
+				m.message = fmt.Sprintf("E: invalid buffer number (1-%d)", len(m.buffers))
+				m.msgIsErr = true
+			} else {
+				m.switchToBuffer(n - 1)
+			}
+		}
+
+	// --- File browser ---
+	case "Ex", "E":
+		dir := "."
+		if m.filename != "" {
+			dir = filepath.Dir(m.filename)
+		}
+		m.openBrowser(dir)
+
+	// --- Clipboard ---
+	case "paste":
+		m.pasteClipboard(false)
+
+	// --- Reload ---
+	case "reload":
+		m.reloadFile()
+
+	// --- Config ---
+	case "config":
+		paths := configPaths()
+		target := paths[0]
+		os.MkdirAll(filepath.Dir(target), 0755)
+		if _, err := os.Stat(target); os.IsNotExist(err) {
+			os.WriteFile(target, []byte(defaultConfigContent()), 0644)
+		}
+		m.openFileInNewBuffer(target)
+
 	default:
 		m.message = "E492: Not an editor command: " + cmd
 		m.msgIsErr = true
@@ -1288,7 +1801,6 @@ func (m *model) jumpToMatch(fwd bool) {
 // Operator + motion
 // ---------------------------------------------------------------------------
 
-// operatorRange returns [lo, hi) for the line at cy and a cursor position after.
 func (m model) operatorRange(motionKey string) (lo, hi, cur int, ok bool) {
 	line := m.lines[m.cy]
 	cx := m.cx
@@ -1332,8 +1844,6 @@ func (m model) operatorRange(motionKey string) (lo, hi, cur int, ok bool) {
 	return 0, 0, 0, false
 }
 
-// applyOperator executes d/y and handles saveUndo internally.
-// For "c" use applyOperatorRaw (which also sets mode=insert).
 func (m *model) applyOperator(op, motionKey string) {
 	lo, hi, cur, ok := m.operatorRange(motionKey)
 	if !ok {
@@ -1348,22 +1858,21 @@ func (m *model) applyOperator(op, motionKey string) {
 		m.clampCursor()
 		m.dirty = true
 	case "c_raw":
-		// internal use for dot replay: like "c" but no mode change, no saveUndo
 		m.lines[m.cy] = append(line[:lo:lo], line[hi:]...)
 		m.cx = cur
 		m.clampCursor()
 		m.dirty = true
 	case "y":
 		if hi > lo {
-			m.register = [][]rune{append([]rune{}, line[lo:hi]...)}
+			yanked := append([]rune{}, line[lo:hi]...)
+			m.register = [][]rune{yanked}
 			m.regIsLine = false
 			m.message = fmt.Sprintf("%d chars yanked", hi-lo)
+			m.clipCopy(string(yanked))
 		}
 	}
 }
 
-// applyOperatorRaw is like applyOperator("c") but is called from the pending
-// handler after saveUndo has already been called. It sets mode=insertMode.
 func (m *model) applyOperatorRaw(op, motionKey string) {
 	lo, hi, cur, ok := m.operatorRange(motionKey)
 	if !ok {
@@ -1424,10 +1933,9 @@ func (m *model) yankLine() {
 	m.register = [][]rune{append([]rune{}, m.lines[m.cy]...)}
 	m.regIsLine = true
 	m.message = "1 line yanked"
+	m.clipCopy(string(m.lines[m.cy]) + "\n")
 }
 
-// insertPaste inserts clipboard text (from bracketed paste) at the cursor in
-// insert mode. Each newline splits the line without adding auto-indent.
 func (m *model) insertPaste(text string) {
 	if text == "" {
 		return
@@ -1437,7 +1945,6 @@ func (m *model) insertPaste(text string) {
 	chunks := strings.Split(text, "\n")
 	for i, chunk := range chunks {
 		if i > 0 {
-			// Split the current line at cx, creating a new line below.
 			line := m.lines[m.cy]
 			before := append([]rune{}, line[:m.cx]...)
 			after := append([]rune{}, line[m.cx:]...)
@@ -1480,7 +1987,6 @@ func (m *model) paste(before bool) {
 		m.cy = at
 		m.cx = 0
 	} else if len(m.register) == 1 {
-		// Single-line character-wise paste
 		ins := m.register[0]
 		if len(ins) == 0 {
 			return
@@ -1497,9 +2003,6 @@ func (m *model) paste(before bool) {
 		m.lines[m.cy] = newLine
 		m.cx = at + len(ins) - 1
 	} else {
-		// Multi-line character-wise paste: split current line at insertion point,
-		// append register[0] to the first half, insert middle rows as new lines,
-		// prepend register[last] to the second half.
 		line := m.lines[m.cy]
 		at := m.cx
 		if !before && len(line) > 0 {
@@ -1507,16 +2010,13 @@ func (m *model) paste(before bool) {
 		}
 		firstHalf := append([]rune{}, line[:at]...)
 		secondHalf := append([]rune{}, line[at:]...)
-
 		firstRow := append(firstHalf, m.register[0]...)
 		lastRow := append(append([]rune{}, m.register[len(m.register)-1]...), secondHalf...)
-
 		newLines := [][]rune{firstRow}
 		for _, r := range m.register[1 : len(m.register)-1] {
 			newLines = append(newLines, append([]rune{}, r...))
 		}
 		newLines = append(newLines, lastRow)
-
 		tail := make([][]rune, len(m.lines[m.cy+1:]))
 		copy(tail, m.lines[m.cy+1:])
 		m.lines = append(m.lines[:m.cy], append(newLines, tail...)...)
@@ -1530,6 +2030,23 @@ func (m *model) paste(before bool) {
 	}
 	m.dirty = true
 	m.scrollIntoView()
+}
+
+func (m *model) pasteClipboard(before bool) {
+	text, err := pasteFromClipboard(m.cfg)
+	if err != nil {
+		m.message = fmt.Sprintf("E: clipboard: %v", err)
+		m.msgIsErr = true
+		return
+	}
+	if text == "" {
+		return
+	}
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	m.register = splitLines(text)
+	m.regIsLine = strings.Count(text, "\n") > 1
+	m.saveUndo()
+	m.paste(before)
 }
 
 // ---------------------------------------------------------------------------
@@ -1547,6 +2064,9 @@ func (m *model) clampCursor() {
 
 func (m *model) scrollIntoView() {
 	editorHeight := m.height - 2
+	if len(m.buffers) > 1 {
+		editorHeight--
+	}
 	if editorHeight <= 0 {
 		editorHeight = 1
 	}
@@ -1610,6 +2130,11 @@ func (m *model) yankSel(sel selRange) {
 		m.register = cloneLines(m.lines[sel.startRow : sel.endRow+1])
 		m.regIsLine = true
 		m.message = fmt.Sprintf("%d lines yanked", sel.endRow-sel.startRow+1)
+		var textParts []string
+		for row := sel.startRow; row <= sel.endRow; row++ {
+			textParts = append(textParts, string(m.lines[row]))
+		}
+		m.clipCopy(strings.Join(textParts, "\n") + "\n")
 		return
 	}
 	if sel.startRow == sel.endRow {
@@ -1618,30 +2143,40 @@ func (m *model) yankSel(sel selRange) {
 		if end > len(line) {
 			end = len(line)
 		}
-		m.register = [][]rune{append([]rune{}, line[sel.startCol:end]...)}
+		yanked := append([]rune{}, line[sel.startCol:end]...)
+		m.register = [][]rune{yanked}
 		m.regIsLine = false
 		m.message = fmt.Sprintf("%d chars yanked", end-sel.startCol)
+		m.clipCopy(string(yanked))
 		return
 	}
 	var reg [][]rune
+	var textParts []string
 	for row := sel.startRow; row <= sel.endRow; row++ {
 		line := m.lines[row]
 		switch row {
 		case sel.startRow:
-			reg = append(reg, append([]rune{}, line[sel.startCol:]...))
+			yanked := append([]rune{}, line[sel.startCol:]...)
+			reg = append(reg, yanked)
+			textParts = append(textParts, string(yanked))
 		case sel.endRow:
 			end := sel.endCol + 1
 			if end > len(line) {
 				end = len(line)
 			}
-			reg = append(reg, append([]rune{}, line[:end]...))
+			yanked := append([]rune{}, line[:end]...)
+			reg = append(reg, yanked)
+			textParts = append(textParts, string(yanked))
 		default:
-			reg = append(reg, append([]rune{}, line...))
+			yanked := append([]rune{}, line...)
+			reg = append(reg, yanked)
+			textParts = append(textParts, string(yanked))
 		}
 	}
 	m.register = reg
 	m.regIsLine = false
 	m.message = fmt.Sprintf("%d lines yanked", sel.endRow-sel.startRow+1)
+	m.clipCopy(strings.Join(textParts, "\n"))
 }
 
 func (m *model) deleteSel(sel selRange) {
@@ -1787,7 +2322,7 @@ func (m model) handleVisual(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		sel := m.visualSel()
 		m.saveUndo()
 		m.deleteSel(sel)
-		m.dotEntry = "i" // after deletion cursor is in position; treat as "i"
+		m.dotEntry = "i"
 		m.dotTyped = nil
 		m.mode = insertMode
 	case "~":
@@ -1818,12 +2353,178 @@ func (m model) handleVisual(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 // ---------------------------------------------------------------------------
+// File browser
+// ---------------------------------------------------------------------------
+
+func readDirSorted(dir string, showHidden bool) []dirEntry {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	var result []dirEntry
+	for _, e := range entries {
+		if !showHidden && strings.HasPrefix(e.Name(), ".") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		result = append(result, dirEntry{
+			Name:  e.Name(),
+			Size:  info.Size(),
+			Mode:  info.Mode(),
+			IsDir: e.IsDir(),
+		})
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].IsDir != result[j].IsDir {
+			return result[i].IsDir
+		}
+		return strings.ToLower(result[i].Name) < strings.ToLower(result[j].Name)
+	})
+	// Prepend parent directory
+	result = append([]dirEntry{{Name: "..", IsDir: true}}, result...)
+	return result
+}
+
+func formatSize(size int64) string {
+	if size < 1024 {
+		return fmt.Sprintf("%4dB", size)
+	}
+	if size < 1024*1024 {
+		return fmt.Sprintf("%4.1fK", float64(size)/1024)
+	}
+	return fmt.Sprintf("%4.1fM", float64(size)/(1024*1024))
+}
+
+func (m *model) openBrowser(dir string) {
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		absDir = dir
+	}
+	m.browserDir = absDir
+	m.browserEntries = readDirSorted(absDir, m.browserShowHidden)
+	m.browserCur = 0
+	m.browserScroll = 0
+	m.mode = browserMode
+	m.message = ""
+}
+
+func (m *model) browserScrollIntoView() {
+	h := m.height - 3 // status bar + command line + header
+	if len(m.buffers) > 1 {
+		h--
+	}
+	if h < 1 {
+		h = 1
+	}
+	if m.browserCur < m.browserScroll {
+		m.browserScroll = m.browserCur
+	} else if m.browserCur >= m.browserScroll+h {
+		m.browserScroll = m.browserCur - h + 1
+	}
+}
+
+func (m model) handleBrowser(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	key := msg.String()
+
+	// Handle pending 'g' for 'gg'
+	if m.browserPendingG {
+		m.browserPendingG = false
+		if key == "g" {
+			m.browserCur = 0
+			m.browserScroll = 0
+		}
+		return m, nil
+	}
+
+	switch key {
+	case "q", "esc":
+		m.mode = normalMode
+	case "g":
+		m.browserPendingG = true
+	case "G":
+		if len(m.browserEntries) > 0 {
+			m.browserCur = len(m.browserEntries) - 1
+			m.browserScrollIntoView()
+		}
+	case "j", "down":
+		if m.browserCur < len(m.browserEntries)-1 {
+			m.browserCur++
+			m.browserScrollIntoView()
+		}
+	case "k", "up":
+		if m.browserCur > 0 {
+			m.browserCur--
+			m.browserScrollIntoView()
+		}
+	case "h", "left":
+		parent := filepath.Dir(m.browserDir)
+		if parent != m.browserDir {
+			m.browserDir = parent
+			m.browserEntries = readDirSorted(parent, m.browserShowHidden)
+			m.browserCur = 0
+			m.browserScroll = 0
+		}
+	case "l", "right", "enter":
+		if m.browserCur >= len(m.browserEntries) {
+			return m, nil
+		}
+		entry := m.browserEntries[m.browserCur]
+		var path string
+		if entry.Name == ".." {
+			path = filepath.Dir(m.browserDir)
+		} else {
+			path = filepath.Join(m.browserDir, entry.Name)
+		}
+		if entry.IsDir {
+			m.browserDir = path
+			m.browserEntries = readDirSorted(path, m.browserShowHidden)
+			m.browserCur = 0
+			m.browserScroll = 0
+		} else {
+			m.mode = normalMode
+			m.openFileInNewBuffer(path)
+		}
+	case ".":
+		m.browserShowHidden = !m.browserShowHidden
+		m.browserEntries = readDirSorted(m.browserDir, m.browserShowHidden)
+		if m.browserCur >= len(m.browserEntries) {
+			m.browserCur = len(m.browserEntries) - 1
+		}
+		if m.browserCur < 0 {
+			m.browserCur = 0
+		}
+		m.browserScrollIntoView()
+	case "ctrl+d":
+		h := m.height - 3
+		if len(m.buffers) > 1 {
+			h--
+		}
+		m.browserCur += h / 2
+		if m.browserCur >= len(m.browserEntries) {
+			m.browserCur = len(m.browserEntries) - 1
+		}
+		m.browserScrollIntoView()
+	case "ctrl+u":
+		h := m.height - 3
+		if len(m.buffers) > 1 {
+			h--
+		}
+		m.browserCur -= h / 2
+		if m.browserCur < 0 {
+			m.browserCur = 0
+		}
+		m.browserScrollIntoView()
+	}
+	return m, nil
+}
+
+// ---------------------------------------------------------------------------
 // Help buffer
 // ---------------------------------------------------------------------------
 
-// helpText returns the help content as plain-text lines loaded into a
-// read-only norn buffer. All normal-mode navigation (hjkl, gg/G, /, n/N …)
-// works naturally inside it. :q returns to the previous file.
 func helpText() [][]rune {
 	raw := `================================================================================
                            norn  KEY BINDINGS
@@ -1882,6 +2583,11 @@ EDITING  (normal mode)
   >>  /  <<                 Indent / dedent current line
   {n}>>  /  {n}<<           Indent / dedent n lines
 
+CLIPBOARD
+  gp                        Paste from system clipboard
+  :paste                    Paste from system clipboard
+  Yank operations automatically copy to system clipboard (configurable)
+
 PASTE & UNDO
   p / P                     Paste after / before cursor
   u                         Undo
@@ -1902,6 +2608,37 @@ VISUAL MODE
   ~                         Toggle case of selection
   p                         Paste over selection
 
+MULTIPLE BUFFERS
+  :e {file}                 Open file in new buffer (or directory for browser)
+  :bn                       Switch to next buffer
+  :bp                       Switch to previous buffer
+  :ls                       List open buffers
+  :bd                       Close current buffer (:bd! to force)
+  :b {n}                    Switch to buffer number n
+  :reload                   Reload current file from disk
+
+FILE BROWSER  (:Ex or :E)
+  j / k  or  Up / Down      Navigate entries
+  h / l  or  Left / Right   Go to parent / enter directory
+  Enter  or  Right          Open file or enter directory
+  gg / G                     Jump to first / last entry
+  ctrl+d / ctrl+u           Scroll half-page
+  .                         Toggle hidden files
+  q / Esc                   Close browser
+
+CONFIGURATION
+  :config                   Open config file for editing
+  :reload                   Reload current file from disk
+
+  Config file: ~/.config/norn/config.toml
+
+  [editor]
+  tabstop = 4               Spaces per tab (for >>/<< and expandtab)
+  expandtab = false          Use spaces instead of tabs
+  number = true              Show line numbers
+  relativenumber = false     Show relative line numbers
+  clipboard = "auto"        "auto", "none", "pbcopy", "xclip", "xsel", "wl-copy"
+
 COUNT PREFIXES
   {n}{motion}               Repeat motion n times  (e.g. 3j, 5w, 10l)
   {n}dd / {n}>>             Delete / indent n lines
@@ -1914,16 +2651,17 @@ COMMANDS  (:)
   :wq                       Save and quit
   :noh                      Clear search highlight
   :help  or  :h             Open this help buffer
+  :version  or  :ver        Show version
+  :paste                    Paste from system clipboard
+  :config                   Open config file
 
 ================================================================================`
 	return splitLines(raw)
 }
 
-// openHelpBuffer swaps in the help text as a read-only buffer, saving the
-// current model so :q can restore it.
 func (m *model) openHelpBuffer() {
 	prev := *m
-	prev.prevModel = nil // don't chain saves
+	prev.prevModel = nil
 	m.lines = helpText()
 	m.filename = "[Help]"
 	m.dirty = false
@@ -1992,22 +2730,134 @@ func (m model) renderLine(lineIdx int) string {
 	return sb.String()
 }
 
-func (m model) View() string {
+func (m model) renderTabLine() string {
+	if len(m.buffers) <= 1 {
+		return ""
+	}
 	var sb strings.Builder
-	editorHeight := m.height - 2
-
-	for i := 0; i < editorHeight; i++ {
-		lineIdx := m.scrollY + i
-		var num, content string
-		if lineIdx < len(m.lines) {
-			num = lineNum.Render(fmt.Sprintf("%d", lineIdx+1))
-			content = m.renderLine(lineIdx)
-		} else {
-			num = lineNum.Render("~")
+	for i, b := range m.buffers {
+		name := filepath.Base(b.filename)
+		if b.filename == "" {
+			name = "[No Name]"
 		}
-		sb.WriteString(num + " " + content + "\n")
+		if b.dirty {
+			name += "+"
+		}
+		if i == m.bufIdx {
+			sb.WriteString(activeTabStyle.Render(" " + name + " "))
+		} else {
+			sb.WriteString(inactiveTabStyle.Render(" " + name + " "))
+		}
+	}
+	content := sb.String()
+	w := lipgloss.Width(content)
+	if w < m.width {
+		content += tabBarStyle.Render(strings.Repeat(" ", m.width-w))
+	}
+	return content
+}
+
+func (m model) renderBrowserView(sb *strings.Builder) {
+	// Header
+	header := fmt.Sprintf(" norn browser: %s", m.browserDir)
+	sb.WriteString(browserHeaderStyle.Render(header))
+	sb.WriteString("\n")
+
+	h := m.height - 3
+	if len(m.buffers) > 1 {
+		h--
+	}
+	if h < 1 {
+		h = 1
 	}
 
+	for i := 0; i < h; i++ {
+		idx := m.browserScroll + i
+		if idx >= len(m.browserEntries) {
+			sb.WriteString("\n")
+			continue
+		}
+		entry := m.browserEntries[idx]
+		name := entry.Name
+		if entry.IsDir {
+			name += "/"
+		}
+
+		sizeStr := ""
+		if !entry.IsDir && entry.Name != ".." {
+			sizeStr = "  " + formatSize(entry.Size)
+		}
+
+		line := "  " + name + sizeStr
+
+		if idx == m.browserCur {
+			sb.WriteString(browserCursorStyle.Render(line))
+		} else if entry.IsDir {
+			sb.WriteString(browserDirStyle.Render(line))
+		} else {
+			sb.WriteString(line)
+		}
+		sb.WriteString("\n")
+	}
+}
+
+func (m model) View() string {
+	var sb strings.Builder
+
+	// Tab line
+	hasTabs := len(m.buffers) > 1
+	if hasTabs {
+		sb.WriteString(m.renderTabLine())
+		sb.WriteString("\n")
+	}
+
+	if m.mode == browserMode {
+		m.renderBrowserView(&sb)
+	} else {
+		editorHeight := m.height - 2
+		if hasTabs {
+			editorHeight--
+		}
+		if editorHeight < 1 {
+			editorHeight = 1
+		}
+
+		for i := 0; i < editorHeight; i++ {
+			lineIdx := m.scrollY + i
+			var num, content string
+			if lineIdx < len(m.lines) {
+				if m.cfg.Editor.Number {
+					if m.cfg.Editor.RelativeNumber {
+						rel := lineIdx - m.cy
+						if rel == 0 {
+							num = lineNumStyle.Render(fmt.Sprintf("%d", lineIdx+1))
+						} else {
+							abs := rel
+							if abs < 0 {
+								abs = -abs
+							}
+							num = lineNumStyle.Render(fmt.Sprintf("%d", abs))
+						}
+					} else {
+						num = lineNumStyle.Render(fmt.Sprintf("%d", lineIdx+1))
+					}
+					content = num + " " + m.renderLine(lineIdx)
+				} else {
+					content = m.renderLine(lineIdx)
+				}
+			} else {
+				if m.cfg.Editor.Number {
+					num = lineNumStyle.Render("~")
+					content = num + " "
+				} else {
+					content = "~"
+				}
+			}
+			sb.WriteString(content + "\n")
+		}
+	}
+
+	// Status bar
 	var modeLabel string
 	var modeStyle lipgloss.Style
 	switch m.mode {
@@ -2029,6 +2879,9 @@ func (m model) View() string {
 	case visualLineMode:
 		modeLabel = " VISUAL LINE "
 		modeStyle = statusVisual
+	case browserMode:
+		modeLabel = " BROWSER "
+		modeStyle = statusBrowser
 	}
 
 	fname := m.filename
@@ -2043,6 +2896,10 @@ func (m model) View() string {
 	// show count prefix in status bar while typing a number
 	if m.countStr != "" {
 		fname = m.countStr + " | " + fname
+	}
+	// Show buffer index if multiple
+	if len(m.buffers) > 1 {
+		fname = fmt.Sprintf("%d/%d ", m.bufIdx+1, len(m.buffers)) + fname
 	}
 	pos := fmt.Sprintf("%d:%d", m.cy+1, m.cx+1)
 	middle := " " + fname + " "
@@ -2079,11 +2936,8 @@ func (m model) View() string {
 // Entry point
 // ---------------------------------------------------------------------------
 
-const version = "0.1.0"
+const version = "0.2.0"
 
-// runShellAndPause is the vim-style internal subcommand used by :!{cmd}.
-// norn calls itself with --run-shell so that the pause ("Hit ENTER") is
-// handled in Go code rather than a shell `read`, matching how vim does it.
 func runShellAndPause(shell string) {
 	c := exec.Command("sh", "-c", shell)
 	c.Stdin = os.Stdin
@@ -2092,14 +2946,11 @@ func runShellAndPause(shell string) {
 	_ = c.Run()
 
 	fmt.Print("\n\033[33m-- Hit ENTER to return to norn --\033[0m")
-	// Read one byte directly from stdin. By the time this runs, BubbleTea
-	// has fully released the terminal, so this blocks cleanly on user input.
 	buf := make([]byte, 1)
-	os.Stdin.Read(buf) //nolint:errcheck
+	os.Stdin.Read(buf)
 }
 
 func main() {
-	// Internal subcommand: run a shell command then pause (used by :!)
 	if len(os.Args) >= 3 && os.Args[1] == "--run-shell" {
 		runShellAndPause(strings.Join(os.Args[2:], " "))
 		os.Exit(0)
@@ -2115,6 +2966,18 @@ func main() {
 			fmt.Println("Usage: norn [file]")
 			fmt.Println("       norn --version")
 			fmt.Println("Open file in the norn editor. Run :help inside the editor for key bindings.")
+			fmt.Println("")
+			fmt.Println("Commands inside editor:")
+			fmt.Println("  :e {file}       Open file in new buffer")
+			fmt.Println("  :Ex / :E        Open file browser")
+			fmt.Println("  :bn / :bp       Next / previous buffer")
+			fmt.Println("  :ls              List buffers")
+			fmt.Println("  :bd              Close buffer")
+			fmt.Println("  :config          Open config file")
+			fmt.Println("  :paste           Paste from system clipboard")
+			fmt.Println("  gp               Paste from system clipboard (normal mode)")
+			fmt.Println("")
+			fmt.Println("Config: ~/.config/norn/config.toml")
 			os.Exit(0)
 		default:
 			if filename == "" {
